@@ -1,0 +1,13 @@
+app = "lux-bot"
+primary_region = "ord"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  COMMAND_PREFIX = "!"
+  LOG_LEVEL = "info"
+
+[mounts]
+  source = "lux_data"
+  destination = "/data"

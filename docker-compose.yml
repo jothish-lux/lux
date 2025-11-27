@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+lux:
+build: .
+container_name: lux-bot
+volumes:
+- ./core/auth:/app/core/auth
+- ./db:/app/db
+environment:
+- COMMAND_PREFIX=!
+- LOG_LEVEL=info
+restart: unless-stopped
