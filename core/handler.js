@@ -1,40 +1,80 @@
-const config = require('../config/config');
-const { loadCommands } = require('../system/commandLoader');
-const path = require('path');
+// core/handler.js
+const { loadCommands } = require('./commands');
 
+/**
+ * init - attach message handler to a Baileys client
+ * @param {object} params
+ * @param {import('@adiwajshing/baileys').WASocket} params.client
+ * @param {object} params.db - simple db adapter with get/set methods
+ * @param {object} params.config - config object {PREFIX, OWNER}
+ */
+function init({ client, db, config }) {
+  const commands = loadCommands();
 
-function createHandler({ sock, db }) {
-const commands = loadCommands(path.join(__dirname, '..', 'commands'));
+  client.ev.on('messages.upsert', async (m) => {
+    try {
+      const messages = m.messages;
+      if (!messages || !messages.length) return;
+      const msg = messages[0];
 
+      // ignore non-user messages and our own messages
+      if (!msg.message || msg.key?.fromMe) return;
 
-return async function handleMessage(m) {
-try {
-const [message] = m.messages;
-if (!message || !message.message) return;
-if (message.key?.fromMe) return;
+      // get text from message (covers plain and extended text)
+      let text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        msg.message.imageMessage?.caption ||
+        msg.message.videoMessage?.caption ||
+        '';
+      text = (text || '').trim();
+      if (!text) return;
 
+      const prefix = config.PREFIX || '!';
+      if (!text.startsWith(prefix)) return;
 
-let text = '';
-if (message.message.conversation) text = message.message.conversation;
-else if (message.message.extendedTextMessage) text = message.message.extendedTextMessage.text;
-else if (message.message.imageMessage?.caption) text = message.message.imageMessage.caption;
+      const withoutPrefix = text.slice(prefix.length).trim();
+      if (!withoutPrefix) return;
+      const [cmdNameRaw, ...args] = withoutPrefix.split(/\s+/);
+      const cmdName = cmdNameRaw.toLowerCase();
 
+      const cmd = commands.get(cmdName);
+      if (!cmd) {
+        // unknown command: optionally reply or ignore
+        return;
+      }
 
-if (!text) return;
-if (!text.startsWith(config.prefix)) return;
+      // permission checks
+      const sender = msg.key.participant || msg.key.remoteJid;
+      const isOwner = (Array.isArray(config.OWNER) ? config.OWNER : [config.OWNER]).includes(sender);
 
+      if (cmd.ownerOnly && !isOwner) {
+        await client.sendMessage(msg.key.remoteJid, { text: '❌ Owner-only command.' }, { quoted: msg });
+        return;
+      }
 
-const [cmdName, ...args] = text.slice(config.prefix.length).trim().split(/\s+/);
-const cmd = commands.get(cmdName.toLowerCase());
-if (!cmd) return sock.sendMessage(message.key.remoteJid, { text: `Unknown command: ${cmdName}` }, { quoted: message });
+      if (cmd.groupOnly && !msg.key.remoteJid.endsWith('@g.us')) {
+        await client.sendMessage(msg.key.remoteJid, { text: '❌ This command works only in groups.' }, { quoted: msg });
+        return;
+      }
 
-
-await cmd.run({ sock, msg: message, args, db });
-} catch (e) {
-console.error('handler error', e);
+      // execute command
+      try {
+        await cmd.execute({
+          msg,
+          client,
+          db,
+          args,
+          config,
+        });
+      } catch (err) {
+        console.error('command execute error', err);
+        await client.sendMessage(msg.key.remoteJid, { text: `⚠️ Command error: ${String(err.message || err)}` }, { quoted: msg });
+      }
+    } catch (e) {
+      console.error('handler outer error', e);
+    }
+  });
 }
-};
-}
 
-
-module.exports = { createHandler };
+module.exports = { init };

@@ -1,1 +1,19 @@
-{"name":"lux-bot","version":"0.1.0","main":"core/index.js","scripts":{"start":"node core/index.js"},"dependencies":{"@adiwajshing/baileys":"^4.4.0","chokidar":"^3.5.3","dotenv":"^16.0.0","express":"^5.1.0","lodash":"^4.17.21","lowdb":"^6.0.1","pg":"^8.16.3","pino":"^8.0.0"}}
+{
+  "name": "lux-bot",
+  "version": "0.1.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon --watch ./commands --watch ./core index.js"
+  },
+  "dependencies": {
+    "@adiwajshing/baileys": "^5.0.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "dotenv": "^16.0.0",
+    "pino": "^8.0.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.0"
+  }
+}
