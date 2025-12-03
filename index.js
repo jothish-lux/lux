@@ -1,253 +1,308 @@
-// index.js - ES module
-import fs from 'fs';
-import path from 'path';
-import qrcode from 'qrcode-terminal';
-import sharp from 'sharp';
+// index.js — Full bot: .sticker replies-to-image supported
+// Dependencies:
+// npm install @whiskeysockets/baileys@^6.7.19 pino qrcode qrcode-terminal qrcode sharp
 
-// dynamic import of baileys so we can gracefully handle different exports
-const baileys = await import('@whiskeysockets/baileys').catch((e) => {
-  console.error('Failed to import @whiskeysockets/baileys:', e.message || e);
-  process.exit(1);
-});
-
-const {
-  makeWASocket,
+import makeWASocket, {
   fetchLatestBaileysVersion,
-  delay,
-  downloadContentFromMessage,
-  jidNormalizedUser,
-} = baileys;
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadContentFromMessage
+} from '@whiskeysockets/baileys'
+import pino from 'pino'
+import fs from 'fs'
+import path from 'path'
+import qrcodeTerminal from 'qrcode-terminal'
+import QRCode from 'qrcode'
+import sharp from 'sharp'
 
-// Prefer useSingleFileAuthState, fallback to useMultiFileAuthState
-const useSingleFileAuthState = baileys.useSingleFileAuthState ?? null;
-const useMultiFileAuthState = baileys.useMultiFileAuthState ?? null;
+/* --------------- Config ---------------- */
+const AUTH_FOLDER = './auth_info'
+const QR_PNG_PATH = path.resolve('./qr.png')
+const DOT_PREFIXES = ['.', '．', '｡', '․', '‧', '•', '●']
 
-if (!useSingleFileAuthState && !useMultiFileAuthState) {
-  console.error(`This version of @whiskeysockets/baileys doesn't export useSingleFileAuthState or useMultiFileAuthState.
-Please install a compatible baileys version (e.g. ^6.7.x) or update this code to match your baileys export names.`);
-  process.exit(1);
+function normalizeDotPrefix(text) {
+  if (!text || typeof text !== 'string') return text
+  for (const p of DOT_PREFIXES) if (text.startsWith(p)) return '.' + text.slice(p.length)
+  return text
 }
 
-// choose a path for auth files
-const AUTH_FILE = './auth_info.json';
-let auth;
-if (useSingleFileAuthState) {
-  // use single file state (returns { state, saveCreds })
-  auth = useSingleFileAuthState(AUTH_FILE);
-} else {
-  // useMultiFileAuthState returns { state, saveCreds } too, but may accept a folder
-  // create folder if not exists
-  const multiPath = path.join('.', 'auth_info_multi');
-  if (!fs.existsSync(multiPath)) fs.mkdirSync(multiPath, { recursive: true });
-  auth = await useMultiFileAuthState(multiPath);
+/* ---------------- Commands ---------------- */
+const commands = {
+  help: {
+    exec: async ({ send, from }) =>
+      send(from, {
+        text:
+`*Available Commands (DOT prefix)*
+
+.say <text> — Bot repeats text
+.echo <text> — Echo with "Echo:" prefix
+.ping — Check latency
+.sticker — Send an image with caption ".sticker" or reply ".sticker" to an image
+.help — Show this message`
+      })
+  },
+
+  ping: {
+    exec: async ({ send, from, receivedAt }) => {
+      const now = Date.now()
+      await send(from, { text: `Pong — ${now - receivedAt}ms` })
+    }
+  },
+
+  say: {
+    exec: async ({ send, from, args }) => {
+      const text = args.join(' ').trim()
+      if (!text) return send(from, { text: 'Usage: .say hello' })
+      await send(from, { text })
+    }
+  },
+
+  echo: {
+    exec: async ({ send, from, args }) => {
+      const text = args.join(' ').trim()
+      if (!text) return send(from, { text: 'Usage: .echo hello' })
+      await send(from, { text: `Echo: ${text}\n(automated reply)` })
+    }
+  }
 }
 
-const ALLOW_SELF = Boolean(process.env.ALLOW_SELF_COMMANDS);
-
-function logger(...args) {
-  // minimal logger - print timestamp
-  console.log(new Date().toISOString(), ...args);
+async function runCommand(name, ctx) {
+  const cmd = commands[name]
+  if (!cmd) return ctx.send(ctx.from, { text: `Unknown command: ${name}\nType .help` })
+  return cmd.exec(ctx)
 }
 
-// helper: stream -> buffer
-async function bufferFromStream(stream) {
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks);
+/* ------------- extractText (robust) ------------- */
+function extractText(msg) {
+  if (!msg || !msg.message) return null
+  const m = msg.message
+  const get = (fn) => { try { return fn() } catch { return undefined } }
+
+  const candidates = [
+    get(() => m.conversation),
+    get(() => m.extendedTextMessage?.text),
+    get(() => m.imageMessage?.caption),
+    get(() => m.videoMessage?.caption),
+    get(() => m.documentMessage?.caption),
+    get(() => m.stickerMessage?.text),
+
+    get(() => m.buttonsResponseMessage?.selectedDisplayText),
+    get(() => m.buttonsResponseMessage?.selectedButtonId),
+    get(() => m.listResponseMessage?.title),
+    get(() => m.listResponseMessage?.singleSelectReply?.selectedRowId),
+    get(() => m.templateButtonReplyMessage?.selectedDisplayText),
+    get(() => m.templateButtonReplyMessage?.selectedId),
+
+    get(() => m.ephemeralMessage?.message?.conversation),
+    get(() => m.ephemeralMessage?.message?.extendedTextMessage?.text),
+    get(() => m.ephemeralMessage?.message?.imageMessage?.caption),
+
+    get(() => m.viewOnceMessage?.message?.conversation),
+    get(() => m.viewOnceMessage?.message?.extendedTextMessage?.text),
+    get(() => m.viewOnceMessage?.message?.imageMessage?.caption),
+
+    get(() => m.deviceSentMessage?.message?.conversation),
+    get(() => m.deviceSentMessage?.message?.extendedTextMessage?.text),
+
+    get(() => m.extendedTextMessage?.contextInfo?.quotedMessage?.conversation),
+    get(() => m.extendedTextMessage?.contextInfo?.quotedMessage?.extendedTextMessage?.text),
+    get(() => m.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage?.caption),
+
+    get(() => m.reactionMessage?.text),
+    get(() => m.protocolMessage && String(m.protocolMessage?.type)),
+  ]
+
+  for (const c of candidates) if (typeof c === 'string' && c.trim() !== '') return c
+  return null
 }
 
+/* ---------- findImageMessageInMsg (robust) ---------- */
+function findImageMessageInMsg(msg) {
+  if (!msg || !msg.message) return null
+  const m = msg.message
+  const tryGet = (fn) => { try { return fn() } catch { return undefined } }
+
+  const candidates = [
+    tryGet(() => m.imageMessage),
+    tryGet(() => m.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage),
+    tryGet(() => m.extendedTextMessage?.contextInfo?.quotedMessage?.ephemeralMessage?.message?.imageMessage),
+    tryGet(() => m.ephemeralMessage?.message?.imageMessage),
+    tryGet(() => m.viewOnceMessage?.message?.imageMessage),
+    tryGet(() => m.deviceSentMessage?.message?.imageMessage),
+    tryGet(() => m.extendedTextMessage?.contextInfo?.quotedMessage?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage),
+    tryGet(() => m.extendedTextMessage?.contextInfo?.quotedMessage?.extendedTextMessage?.text && m.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage)
+  ]
+
+  for (const c of candidates) if (c && typeof c === 'object') return c
+  return null
+}
+
+/* ------------- sticker helper ------------- */
+async function downloadImageAndConvertToWebp(msgImage, sock) {
+  if (!msgImage) throw new Error('No imageMessage provided')
+  const stream = await downloadContentFromMessage(msgImage, 'image')
+  let buffer = Buffer.from([])
+  for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk])
+
+  const webpBuffer = await sharp(buffer)
+    .rotate()
+    .resize(512, 512, { fit: 'cover' })
+    .webp({ quality: 90 })
+    .toBuffer()
+
+  return webpBuffer
+}
+
+/* ---------------- Main bot ---------------- */
 async function startSock() {
-  // get latest version (best effort)
-  let version = [2, 3000, 1027934701];
+  const logger = pino({ level: 'info' })
+
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
+
+  let version = undefined
   try {
-    const v = await fetchLatestBaileysVersion();
-    if (Array.isArray(v)) version = v;
-    logger('fetched baileys version', version);
+    const res = await fetchLatestBaileysVersion()
+    version = res.version
+    logger.info({ version, isLatest: res.isLatest }, 'fetched baileys version')
   } catch (e) {
-    logger('could not fetch latest baileys version, using default', e?.message ?? e);
+    logger.warn('Could not fetch latest Baileys version; proceeding with default')
   }
 
-  const sock = makeWASocket({
-    printQRInTerminal: false, // we'll show QR ourselves
-    auth: auth.state,
-    version,
-    connectTimeoutMs: 60_000,
-  });
+  const sock = makeWASocket({ logger, auth: state, version })
+  sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', (update) => {
-    // update can contain: qr, connection, isOnline, lastDisconnect
-    if (update.qr) {
-      logger('QR received — printing to terminal');
-      qrcode.generate(update.qr, { small: true });
-    }
-    if (update.connection) {
-      logger('connection.update', update.connection, update.lastDisconnect ? update.lastDisconnect?.error ?? update.lastDisconnect : '');
-    }
-    if (update.isNewLogin) {
-      logger('isNewLogin', update.isNewLogin);
-    }
-    if (update.isOnline !== undefined) {
-      logger('isOnline', update.isOnline);
-    }
-  });
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
+    logger.info({ update }, 'connection.update')
 
-  // save creds on change
-  sock.ev.on('creds.update', auth.saveCreds);
+    if (qr) {
+      try { qrcodeTerminal.generate(qr, { small: true }) } catch {}
+      try { await QRCode.toFile(QR_PNG_PATH, qr, { margin: 2 }) } catch {}
+      try { fs.writeFileSync('./qr.txt', qr, 'utf8') } catch {}
+    }
 
-  // log low-level errors
-  sock.ev.on('connection.error', (err) => {
-    logger('connection.error', err);
-  });
+    if (connection === 'open') {
+      logger.info('✅ Connected to WhatsApp')
+      try { if (fs.existsSync(QR_PNG_PATH)) fs.unlinkSync(QR_PNG_PATH) } catch {}
+      try { if (fs.existsSync('./qr.txt')) fs.unlinkSync('./qr.txt') } catch {}
+    }
 
-  // handle incoming messages
+    if (connection === 'close') {
+      let reason = undefined
+      try {
+        reason = lastDisconnect?.error?.output?.statusCode
+          ?? lastDisconnect?.error?.statusCode
+          ?? lastDisconnect?.error?.data?.tag?.attrs?.code
+          ?? undefined
+      } catch (e) { reason = undefined }
+
+      logger.warn({ reason, lastDisconnect }, 'connection closed')
+
+      if (reason === DisconnectReason.loggedOut) {
+        logger.error('Logged out — removing auth folder for fresh login')
+        try { if (fs.existsSync(AUTH_FOLDER)) fs.rmSync(AUTH_FOLDER, { recursive: true, force: true }) } catch (err) { logger.error({ err }, 'failed to delete auth folder') }
+        process.exit(0)
+      }
+
+      logger.info('Reconnecting in 2s...')
+      setTimeout(() => startSock(), 2000)
+    }
+  })
+
+  // messages.upsert handler
   sock.ev.on('messages.upsert', async (m) => {
     try {
-      const upsertType = m.type; // 'notify', etc
+      if (m.type !== 'notify') return
+
       for (const msg of m.messages) {
-        if (!msg.message) continue;
+        if (!msg) continue
+        if (msg.key.fromMe) continue
+        if (msg.key.remoteJid === 'status@broadcast') continue
 
-        // skip status broadcast messages
-        if (msg.key && msg.key.remoteJid && msg.key.remoteJid.endsWith('@status.v.whatsapp.net')) continue;
+        const jid = msg.key.remoteJid
+        const msgId = msg.key.id || '<no-id>'
 
-        const from = msg.key.remoteJid;
-        const isFromMe = !!msg.key.fromMe;
-        // Respect ALLOW_SELF_COMMANDS env var
-        if (!ALLOW_SELF && isFromMe) {
-          // ignoring own messages
-          continue;
+        const raw = extractText(msg)
+
+        // debug (optional)
+        console.log('--- incoming message ---')
+        console.log(`from: ${jid} id: ${msgId}`)
+        console.log('rawText visible:', JSON.stringify(raw))
+        console.log('message top keys:', Object.keys(msg.message || {}).slice(0, 8))
+        console.log('------------------------')
+
+        // if no raw text, we'll still be able to handle .sticker if user replied to an image
+        if (!raw) {
+          // check if user replied with a text command in extendedTextMessage?contextInfo - sometimes raw is null but extendedTextMessage exists
+          // For simplicity skip non-text unless it's a reply carrying command inside extendedTextMessage:
+          // (we'll still attempt below when we detect commands)
         }
 
-        // normalize jid for logs
-        const jid = jidNormalizedUser(from);
+        // clean and normalize
+        let cleaned = raw ? raw.trim().replace(/^[\u200E\u200F\u202A-\u202E]+/, '') : ''
+        cleaned = normalizeDotPrefix(cleaned)
 
-        // pull text: conversation, extendedTextMessage, buttonsResponseMessage, listResponseMessage, etc.
-        const message = msg.message;
-        let text = '';
-        if (message.conversation) text = message.conversation;
-        else if (message.extendedTextMessage?.text) text = message.extendedTextMessage.text;
-        else if (message.imageMessage?.caption) text = message.imageMessage.caption;
-        else if (message.documentMessage?.caption) text = message.documentMessage.caption;
-        else if (message.buttonsResponseMessage?.selectedDisplayText) text = message.buttonsResponseMessage.selectedDisplayText;
-        else if (message.listResponseMessage?.singleSelectReply?.selectedDisplayText) text = message.listResponseMessage.singleSelectReply.selectedDisplayText;
+        // send helper & timestamp
+        const send = async (to, content) => sock.sendMessage(to, content)
+        const receivedAt = (msg?.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now())
 
-        text = (text || '').trim();
-        if (!text) {
-          // We may still want to handle sticker creation if user sends captionless image + command as separate message.
-          // But here we ignore empty textual messages.
-        }
+        // If the message text is command-like; but also we want to allow replying to an image where the command is the text of the message (i.e., user replied with ".sticker")
+        if (cleaned.startsWith('.')) {
+          const body = cleaned.slice(1).trim()
+          const [cmdName, ...args] = body.split(/\s+/)
+          const lower = (cmdName || '').toLowerCase()
 
-        // very simple command parse: starts with a dot `.cmd`
-        const isCmd = text.startsWith('.');
-        if (!isCmd) continue;
+          console.log('COMMAND:', lower, args)
 
-        const parts = text.slice(1).split(/\s+/);
-        const cmd = parts.shift().toLowerCase();
-        const args = parts;
+          if (lower === 'sticker') {
+            try {
+              // find image in message or quoted message using helper
+              const imageMessage = findImageMessageInMsg(msg)
 
-        logger(`cmd=${cmd} args=${JSON.stringify(args)} from=${jid} fromMe=${isFromMe}`);
-
-        // create a quoted wrapper to reply (use message.id when available)
-        const quoted = msg.key && msg.key.id ? { quoted: msg } : {};
-
-        // ---------- PING ----------
-        if (cmd === 'ping') {
-          // start timer now
-          const startTs = Date.now();
-
-          // send initial message (optional). We send a short measuring message then follow with time.
-          await sock.sendMessage(from, { text: 'Pong — measuring...' }, quoted);
-
-          // compute elapsed after send finished
-          const elapsed = Date.now() - startTs;
-          await sock.sendMessage(from, { text: `Pong — ${elapsed} ms` }, quoted);
-          continue;
-        }
-
-        // ---------- STICKER ----------
-        if (['sticker', 'stkr', 's'].includes(cmd)) {
-          try {
-            // check quoted message first (user replied to an image/document)
-            const quotedMsg = message?.extendedTextMessage?.contextInfo?.quotedMessage;
-            let candidate = null;
-            if (quotedMsg) {
-              candidate = quotedMsg.imageMessage ?? quotedMsg.documentMessage ?? null;
+              if (!imageMessage) {
+                // If no image found, prompt user
+                await send(jid, { text: 'No image found. Send an image with caption ".sticker" or reply ".sticker" to an image.' })
+              } else {
+                // download & convert
+                const webp = await downloadImageAndConvertToWebp(imageMessage, sock)
+                // send sticker
+                await sock.sendMessage(jid, { sticker: webp })
+                console.log('Sent sticker to', jid)
+              }
+            } catch (err) {
+              console.error('sticker creation error', err)
+              await send(jid, { text: 'Failed to create sticker: ' + (err.message || String(err)) })
             }
-            // fallback to direct attachments
-            if (!candidate) {
-              candidate = message.imageMessage ?? message.documentMessage ?? null;
-            }
-
-            if (!candidate) {
-              await sock.sendMessage(from, { text: 'No image found. Send or reply to an image with caption `.sticker`' }, quoted);
-              continue;
-            }
-
-            // verify it's an image (document may be image mime)
-            const mimetype = candidate.mimetype ?? '';
-            const isImageDoc = mimetype.startsWith?.('image/') ?? false;
-            if (!isImageDoc) {
-              await sock.sendMessage(from, { text: 'Found an attached file but it is not an image. Please send an image or an image-document.' }, quoted);
-              continue;
-            }
-
-            // some history / sync events may not include media keys/directPath yet -> check
-            const hasMediaKey = Boolean(candidate.mediaKey || candidate.directPath || candidate.fileSha256);
-            if (!hasMediaKey) {
-              await sock.sendMessage(from, {
-                text: 'Unable to download that image (media key missing). Please re-send the image directly or reply to the original message again.'
-              }, quoted);
-              continue;
-            }
-
-            // download
-            const stream = await downloadContentFromMessage({ message: candidate }, 'image');
-            const buffer = await bufferFromStream(stream);
-
-            // convert to webp and resize - sharp does the heavy lifting
-            const webpBuf = await sharp(buffer)
-              .rotate() // honor EXIF orientation
-              .resize(512, 512, { fit: 'inside' })
-              .webp({ quality: 80 })
-              .toBuffer();
-
-            await sock.sendMessage(from, { sticker: webpBuf }, quoted);
-          } catch (err) {
-            logger('sticker error', err);
-            await sock.sendMessage(from, { text: `Failed to create sticker: ${err?.message ?? err}` }, quoted);
+            continue
           }
-          continue;
+
+          // other commands
+          try {
+            await runCommand(lower, { send, from: jid, args, receivedAt, msg })
+          } catch (errCmd) {
+            console.error('command error', errCmd)
+            await send(jid, { text: `Command error: ${errCmd.message || String(errCmd)}` })
+          }
+          continue
         }
 
-        // ---------- fallback echo for dev ----------
-        if (cmd === 'echo') {
-          await sock.sendMessage(from, { text: args.join(' ') || 'echo' }, quoted);
-          continue;
+        // not a command -> fallback echo if text present
+        if (cleaned) {
+          await send(jid, { text: `Echo: ${cleaned}\n(automated reply)` })
         }
-
-        // unknown command - optionally notify
-        await sock.sendMessage(from, { text: `Unknown command: ${cmd}` }, quoted);
       }
-    } catch (e) {
-      logger('messages.upsert handler error', e?.stack ?? e);
+    } catch (err) {
+      logger.error({ err }, 'error in messages.upsert handler')
     }
-  });
+  })
 
-  // catch-all for other events to help debug
-  sock.ev.on('messages.delete', (m) => logger('messages.delete', m));
-  sock.ev.on('contacts.update', (c) => logger('contacts.update', c?.length ?? c));
+  sock.ev.on('contacts.update', (contacts) => logger.info({ contacts }, 'contacts.update'))
 
-  // error handling
-  sock.ev.on('connection.update', (u) => {
-    if (u?.lastDisconnect) {
-      logger('lastDisconnect', u.lastDisconnect);
-    }
-  });
-
-  logger('started socket (listening for messages)');
+  return sock
 }
 
-// start
-startSock().catch((err) => {
-  console.error('Fatal error starting socket:', err?.stack ?? err);
-  process.exit(1);
-});
+/* ----------------- Start ----------------- */
+startSock().catch(err => {
+  console.error('startSock failed', err)
+  process.exit(1)
+})
