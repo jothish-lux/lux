@@ -26,6 +26,12 @@ function normalizeDotPrefix(text) {
   return text
 }
 
+/* --------------- Echo state (per-chat) --------------- */
+// echoState[jid] === false  -> echo disabled for that chat
+// echoState[jid] === true   -> echo enabled
+// echoState[jid] === undefined -> treated as enabled (default)
+const echoState = Object.create(null)
+
 /* ---------------- Commands ---------------- */
 const commands = {
   help: {
@@ -38,6 +44,8 @@ const commands = {
 .echo <text> — Echo with "Echo:" prefix
 .ping — Check latency
 .sticker — Send an image with caption ".sticker" or reply ".sticker" to an image
+.echoon — Enable echo mode for this chat
+.echooff — Disable echo mode for this chat
 .help — Show this message`
       })
   },
@@ -62,6 +70,20 @@ const commands = {
       const text = args.join(' ').trim()
       if (!text) return send(from, { text: 'Usage: .echo hello' })
       await send(from, { text: `Echo: ${text}\n(automated reply)` })
+    }
+  },
+
+  echoon: {
+    exec: async ({ send, from }) => {
+      echoState[from] = true
+      await send(from, { text: '✅ Echo mode enabled for this chat.' })
+    }
+  },
+
+  echooff: {
+    exec: async ({ send, from }) => {
+      echoState[from] = false
+      await send(from, { text: '🔇 Echo mode disabled for this chat.' })
     }
   }
 }
@@ -231,13 +253,6 @@ async function startSock() {
         console.log('message top keys:', Object.keys(msg.message || {}).slice(0, 8))
         console.log('------------------------')
 
-        // if no raw text, we'll still be able to handle .sticker if user replied to an image
-        if (!raw) {
-          // check if user replied with a text command in extendedTextMessage?contextInfo - sometimes raw is null but extendedTextMessage exists
-          // For simplicity skip non-text unless it's a reply carrying command inside extendedTextMessage:
-          // (we'll still attempt below when we detect commands)
-        }
-
         // clean and normalize
         let cleaned = raw ? raw.trim().replace(/^[\u200E\u200F\u202A-\u202E]+/, '') : ''
         cleaned = normalizeDotPrefix(cleaned)
@@ -246,7 +261,7 @@ async function startSock() {
         const send = async (to, content) => sock.sendMessage(to, content)
         const receivedAt = (msg?.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now())
 
-        // If the message text is command-like; but also we want to allow replying to an image where the command is the text of the message (i.e., user replied with ".sticker")
+        // If the message text is command-like
         if (cleaned.startsWith('.')) {
           const body = cleaned.slice(1).trim()
           const [cmdName, ...args] = body.split(/\s+/)
@@ -286,8 +301,10 @@ async function startSock() {
           continue
         }
 
-        // not a command -> fallback echo if text present
-        if (cleaned) {
+        // not a command -> fallback echo IF echo mode is enabled for this chat
+        // default: echo is ON unless explicitly turned off via .echooff
+        const echoEnabled = echoState[jid] !== false
+        if (cleaned && echoEnabled) {
           await send(jid, { text: `Echo: ${cleaned}\n(automated reply)` })
         }
       }
